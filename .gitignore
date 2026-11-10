@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# IDA databases and their unpacked components
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.$$$
+
+# Generated FLIRT signatures and FLAIR intermediates, built from SDK
+# packages that cannot be redistributed
+*.sig
+*.candidates
+*.pat
+*.exc
+*.err
+
+# Game dumps used for testing
+code.bin
+code-decompressed.bin
+exheader.bin
+extheader.bin
+*.3dsx
+*.3gx
