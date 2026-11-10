@@ -3,6 +3,7 @@ Passes that need IDA's analysis results (functions, instructions), run once
 auto-analysis has settled.
 """
 
+import re
 import struct
 from collections import Counter
 
@@ -20,6 +21,7 @@ import ida_ua
 import ida_xref
 import idautils
 
+from .flirt import Candidates
 from .svc import SEND_SYNC_REQUEST_NAMES, SVC_NAMES
 
 BADADDR = ida_idaapi.BADADDR
@@ -192,3 +194,127 @@ def setup_switch8(start, end):
                 ida_auto.auto_make_code(t)
             tables += 1
     return len(helpers), tables
+
+
+UNKNOWN_LIBNAME = "unknown_libname"
+MAX_LISTED_CANDIDATES = 8
+NEIGHBOUR_RANGE = 0x400
+# Agreeing on more than one scope level (nn::os, not just nn) is what
+# separates a real hint from the namespace every SDK function shares.
+MIN_SCOPE_MATCH = 2
+
+
+def _is_library_name(ea):
+    f = ida_funcs.get_func(ea)
+    name = ida_name.get_name(ea)
+    return bool(f and f.start_ea == ea and f.flags & ida_funcs.FUNC_LIB and
+                not name.startswith(UNKNOWN_LIBNAME))
+
+
+def _plain(name):
+    return re.sub(r"_\d+$", "", name)
+
+
+def _refs_agree(ea, mod):
+    """
+    A candidate whose referenced name contradicts a FLIRT-named target at
+    the same offset is not the function here.
+    """
+    for off, name in mod.refs:
+        targets = list(idautils.CodeRefsFrom(ea + off, False)) + list(idautils.DataRefsFrom(ea + off))
+        named = [t for t in targets if _is_library_name(t)]
+        if named and all(_plain(ida_name.get_name(t)) != name for t in named):
+            return False
+    return True
+
+
+def _scope(name):
+    """Enclosing scopes of a symbol, from its demangled form."""
+    text = ida_name.demangle_name(name, ida_name.MNG_SHORT_FORM) or name
+    parts, depth, cur = [], 0, ""
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            depth -= 1
+        elif c == "(" and depth == 0:
+            break
+        if depth == 0 and text.startswith("::", i):
+            parts.append(cur)
+            cur = ""
+            i += 2
+            continue
+        cur += c
+        i += 1
+    return [p.split(" ")[-1] for p in parts]
+
+
+def _context_names(f):
+    """Names of the FLIRT-identified functions around, calling and called by f."""
+    out = []
+    for ref in idautils.CodeRefsTo(f.start_ea, False):
+        caller = ida_funcs.get_func(ref)
+        if caller and _is_library_name(caller.start_ea):
+            out.append(ida_name.get_name(caller.start_ea))
+    for ea in idautils.FuncItems(f.start_ea):
+        for ref in idautils.CodeRefsFrom(ea, False):
+            callee = ida_funcs.get_func(ref)
+            if callee and callee.start_ea != f.start_ea and _is_library_name(callee.start_ea):
+                out.append(ida_name.get_name(callee.start_ea))
+    for step in (ida_funcs.get_prev_func, ida_funcs.get_next_func):
+        g = step(f.start_ea)
+        if g and abs(g.start_ea - f.start_ea) <= NEIGHBOUR_RANGE and _is_library_name(g.start_ea):
+            out.append(ida_name.get_name(g.start_ea))
+    return out
+
+
+def _pick_by_context(names, context):
+    """The single candidate sharing the deepest scope with the context, if any."""
+    scopes = [_scope(n) for n in context]
+    scored = []
+    for name in names:
+        s = _scope(name)
+        best = 0
+        for t in scopes:
+            k = 0
+            while k < min(len(s), len(t)) and s[k] == t[k]:
+                k += 1
+            best = max(best, k)
+        scored.append((best, name))
+    top = max((b for b, _ in scored), default=0)
+    winners = [n for b, n in scored if b == top]
+    return winners[0] if top >= MIN_SCOPE_MATCH and len(winners) == 1 else None
+
+
+def resolve_unknown_libnames(paths):
+    """
+    List the possible names of each unknown_libname function in its comment,
+    and rename it when the library functions around it point to exactly one.
+    Returns (functions annotated, functions renamed).
+    """
+    cands = Candidates(paths)
+    if not len(cands):
+        return 0, 0
+    span = cands.max_length
+    annotated = renamed = 0
+    for ea in list(idautils.Functions()):
+        if not ida_name.get_name(ea).startswith(UNKNOWN_LIBNAME):
+            continue
+        f = ida_funcs.get_func(ea)
+        data = ida_bytes.get_bytes(ea, span) or b""
+        names = sorted({n for m in cands.match(data) if _refs_agree(ea, m) for n in m.names})
+        if not names:
+            continue
+        shown = sorted({ida_name.demangle_name(n, ida_name.MNG_SHORT_FORM) or n for n in names})
+        lines = shown[:MAX_LISTED_CANDIDATES]
+        if len(shown) > MAX_LISTED_CANDIDATES:
+            lines.append(f"... {len(shown) - MAX_LISTED_CANDIDATES} more")
+        ida_funcs.set_func_cmt(f, "FLIRT candidates:\n" + "\n".join(lines), False)
+        annotated += 1
+        pick = names[0] if len(names) == 1 else _pick_by_context(names, _context_names(f))
+        if pick:
+            _set_name(ea, _unique_name(pick))
+            renamed += 1
+    return annotated, renamed

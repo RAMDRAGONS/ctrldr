@@ -169,8 +169,8 @@ def write_metadata(img):
         node.hashset("services", ",".join(img.exheader.services).encode())
 
 
-def find_signatures():
-    """ctr_*.sig in the user and IDA sig/arm directories, user copies first."""
+def find_signatures(ext="sig"):
+    """ctr_*.<ext> in the user and IDA sig/arm directories, user copies first."""
     dirs = [os.path.join(ida_diskio.get_user_idadir(), "sig", "arm"),
             ida_diskio.idadir(os.path.join("sig", "arm"))]
     found, seen = [], set()
@@ -178,7 +178,7 @@ def find_signatures():
         if not os.path.isdir(d):
             continue
         for n in sorted(os.listdir(d)):
-            if re.fullmatch(r"ctr_.*\.sig", n, re.I) and n.lower() not in seen:
+            if re.fullmatch(r"ctr_.*\." + ext, n, re.I) and n.lower() not in seen:
                 seen.add(n.lower())
                 found.append(os.path.join(d, n))
     return found
@@ -203,6 +203,9 @@ class PostAnalysis(ida_idp.IDB_Hooks):
 
 def run_post_analysis(start, end):
     from ctrldr import idapost
+    annotated, renamed = idapost.resolve_unknown_libnames(find_signatures("candidates"))
+    if annotated:
+        log(f"{annotated} unknown_libname functions given FLIRT candidates, {renamed} renamed")
     helpers, tables = idapost.setup_switch8(start, end)
     if helpers:
         log(f"switch8 helpers: {helpers}, tables set up: {tables}")

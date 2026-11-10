@@ -33,7 +33,11 @@ alignment and need an ExHeader.
   the 3DS kernel types in `loaders/ctrldr/ctr_types.h`.
 - crt0 names (`__ctr_start`, `nninitRegion`, `nnMain`, ...), entry point and
   `main`, functions seeded from call targets.
-- FLIRT signatures `ctr_*.sig` from `sig/arm`, applied automatically.
+- FLIRT signatures `ctr_*.sig` from `sig/arm`, applied automatically. A
+  match on a module several library functions share (`unknown_libname`) gets
+  the possible names from `ctr_*.candidates` as a comment, and is renamed
+  when the library functions calling, called by or next to it share a
+  namespace with exactly one of them.
 - After auto-analysis: every SVC commented, small SVC wrappers named, IPC
   request functions commented with their command header and named
   `IpcRequest_<header>`, and ARMCC `__ARM_switch8` byte tables turned into
@@ -55,7 +59,7 @@ Copy, or symlink, into the IDA user directory (`$IDAUSR`, otherwise
 | --------------------------------------------- | --------------------- |
 | `loaders/ctrldr-ida.py` and `loaders/ctrldr/` | `<user dir>/loaders/` |
 | `plugins/ctrldr_hexrays.py`                   | `<user dir>/plugins/` |
-| generated `ctr_sdk.sig`, `ctr_armcc.sig`      | `<user dir>/sig/arm/` |
+| generated `ctr_*.sig`, `ctr_*.candidates`     | `<user dir>/sig/arm/` |
 
 ## Signatures
 
@@ -76,8 +80,14 @@ python tools/build_ctr_sigs.py \
   directory holding `lib/armlib`. MSIs are unpacked with 7-Zip (`7z`/`7zz` on
   `PATH`, the default Windows install, or `--sevenzip`).
 - Both options repeat. Several SDK versions widen coverage; a function that is
-  identical across versions keeps its name, and code that different libraries
-  share under different names is left as `unknown_libname`.
+  identical across versions keeps its name.
+- Identical code under different names is resolved where the names are one
+  function: ARMCC variant tags (`__aeabi_uidiv$div0`) and alias spellings
+  (`__ARM_x`, `__0x`, `__c89x`, ...), C++ constructor/destructor variants,
+  and the SDK's C wrappers of C++ methods (`nndbgPanic`). Otherwise short
+  functions are dropped, since game accessors share their bytes, and longer
+  ones stay as nameless modules with their names listed in
+  `ctr_*.candidates`.
 - `--flair` and `--out-dir` override the FLAIR and output locations, which
   default to `$IDADIR` or the usual install paths and to the user `sig/arm`.
 

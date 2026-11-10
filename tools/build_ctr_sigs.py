@@ -18,7 +18,9 @@ tarball, or an extracted CTR_SDK directory. --armcc takes a No-Intro ARMCC zip, 
 MSI inside it, or an extracted ARMCC directory (the one holding lib/armlib).
 Unpacking an ARMCC MSI needs the full 7-Zip (7z or 7zz; --sevenzip to override). Every option may repeat; patterns from all
 inputs are merged, and a function that is identical across versions keeps
-its name while ambiguous patterns are dropped.
+its name. Byte-identical functions under different names are dropped when
+short; longer ones stay as nameless modules (unknown_libname in IDA) and
+their candidate names go to ctr_*.candidates beside the signatures.
 """
 
 import argparse
@@ -333,29 +335,47 @@ def armcc_libraries(lib_root):
 # name nothing, and a module left with only those shows up as unknown_libname.
 NOISE_SYMBOL = re.compile(r"^(BuildAttributes\$\$|__tagsym\$\$)")
 MIN_DEFINED_BYTES = 10
+# ARMCC library variants append tags to the symbol (__aeabi_uidiv$div0,
+# _printf$int$ll); every variant is the same routine as far as naming goes.
+# $Sub$$ and Image$$ style linker names do not match.
+VARIANT_SUFFIX = re.compile(r"^([A-Za-z_][^$]*)\$[A-Za-z]\w*(?:\$\w+)*$")
+# Byte-identical functions under different names are kept, nameless, only
+# when long enough that game code is unlikely to share the bytes; short
+# accessors otherwise turn every matching game function into library code.
+MIN_AMBIGUOUS_LENGTH = 32
+
+
+def base_symbol(name):
+    m = VARIANT_SUFFIX.match(name)
+    return m.group(1) if m else name
 
 
 def filter_pattern_line(line):
     """
-    Drop ARMCC noise symbols from a pelf pattern line. Returns None when the
-    module keeps no public name, or when it has so few fixed bytes (one or
-    two instruction stubs such as "b target") that it would match anywhere.
+    Drop ARMCC noise symbols from a pelf pattern line and strip variant tags
+    from the rest. Returns None when the module keeps no public name, or when
+    it has so few fixed bytes (one or two instruction stubs such as
+    "b target") that it would match anywhere.
     """
     tokens = line.split(" ")
     if len(tokens) < 6:
         return line
     head, rest = tokens[:4], tokens[4:]
     kept, tail = [], []
+    seen = set()
     public = 0
     i = 0
     while i < len(rest):
         tok = rest[i]
         if tok.startswith((":", "^")) and i + 1 < len(rest):
-            name = rest[i + 1]
+            name, sep, mask = rest[i + 1].partition(":")
             if not NOISE_SYMBOL.match(name):
-                kept += [tok, name]
-                if tok.startswith(":") and not tok.endswith("@"):
-                    public += 1
+                name = base_symbol(name)
+                if (tok, name) not in seen:
+                    seen.add((tok, name))
+                    kept += [tok, name + sep + mask]
+                    if tok.startswith(":") and not tok.endswith("@"):
+                        public += 1
             i += 2
         else:
             tail.append(tok)
@@ -367,6 +387,37 @@ def filter_pattern_line(line):
     if defined < MIN_DEFINED_BYTES:
         return None
     return " ".join(head + kept + tail)
+
+
+def pattern_names(line):
+    """Public names of a pattern line, in order."""
+    tokens = line.split(" ")
+    return [tokens[i + 1] for i in range(4, len(tokens) - 1)
+            if tokens[i].startswith(":") and not tokens[i].endswith("@")]
+
+
+def _refs(tokens):
+    return tuple(f"{tokens[i]} {tokens[i + 1]}" for i in range(len(tokens) - 1)
+                 if tokens[i].startswith("^"))
+
+
+def collision_key(name, pattern, crc_len, crc, tokens):
+    """
+    What sigmake shows of a module in its .exc file: first name, leading
+    pattern, CRC and references. Versions of a function that differ only
+    past that still share a key.
+    """
+    return (name, pattern, crc_len, crc, _refs(tokens))
+
+
+def pattern_keys(line):
+    t = line.split(" ")
+    return [collision_key(n, t[0], t[1], t[2], t[4:]) for n in pattern_names(line)]
+
+
+def exc_key(name, exc_pattern):
+    t = exc_pattern.split(" ")
+    return collision_key(name, t[2], t[0], t[1], t[3:])
 
 
 def make_patterns(flair, libs, pat_dir):
@@ -392,71 +443,190 @@ def make_patterns(flair, libs, pat_dir):
     return pats
 
 
-def resolve_collisions(exc_path):
+def alias_base(name):
     """
-    sigmake writes colliding patterns to an .exc file. Keep a pattern when
-    every candidate carries the same name (the same function from different
-    library builds); otherwise leave the group unmarked so it is excluded.
+    ARMCC exports C runtime entry points under several spellings: __ARM_x and
+    __x, __softfp_x and x, or x, _x and the printf/scanf feature levels
+    __0x, __1x, __2x and __c89x. C++ constructors and destructors come as
+    complete and base object variants (C1/C2, D1/D2) with identical code.
     """
-    lines = Path(exc_path).read_text(encoding="latin-1").splitlines()
-    out, group = [], []
+    if name.startswith("_Z"):
+        return re.sub(r"(?<=[A-Za-z_])([CD])[0-2]E", r"\1E", name)
+    return re.sub(r"^(__ARM_|__softfp_|__\d|__c89|_+)", "", name)
 
-    def flush():
-        if group:
-            names = {ln.split("\t", 1)[0].split(" ", 1)[0] for ln in group}
-            if len(names) == 1:
-                group[0] = "+" + group[0]
-            out.extend(group)
-            out.append("")
-            group.clear()
 
-    for ln in lines:
+def mangled_path(name):
+    """Identifiers of a plain Itanium nested name, or None for anything else."""
+    m = re.match(r"_ZN[KVr]*", name)
+    if not m:
+        return None
+    pos, parts = m.end(), []
+    while pos < len(name) and name[pos].isdigit():
+        n = re.match(r"\d+", name[pos:]).group()
+        pos += len(n)
+        parts.append(name[pos:pos + int(n)])
+        pos += int(n)
+    return parts if pos < len(name) and name[pos] == "E" and parts else None
+
+
+def canonical_name(names):
+    """
+    The name to keep when every candidate is one function: aliases as above,
+    or a C++ method next to the C API wrapper the SDK builds from it
+    (nndbgPanic for nn::dbg::Panic), where the mangled name is kept for its
+    types. None when the names are different functions.
+    """
+    mangled = {n for n in names if n.startswith("_Z")}
+    plain = names - mangled
+    if mangled and plain:
+        if len({alias_base(n) for n in mangled}) != 1:
+            return None
+        # The C names leave out the CTR platform namespace.
+        paths = [p for p in map(mangled_path, mangled) if p]
+        flat = {"".join(p) for p in paths} | {"".join(x for x in p if x != "CTR") for p in paths}
+        if not flat or not all(n in flat for n in plain):
+            return None
+        names = mangled
+    elif len({alias_base(n) for n in names}) != 1:
+        return None
+    return min(names, key=lambda n: (len(n), n))
+
+
+def read_collisions(exc_path):
+    """
+    Parse sigmake's .exc file into groups of [marker, name, pattern] rows,
+    where marker is the selection prefix sigmake may already have set.
+    """
+    groups, group = [], []
+    for ln in Path(exc_path).read_text(encoding="latin-1").splitlines():
         if ln.startswith(";"):
             continue
         if not ln.strip():
-            flush()
-        else:
-            group.append(ln)
-    flush()
-    Path(exc_path).write_text("\n".join(out) + "\n", encoding="latin-1")
+            if group:
+                groups.append(group)
+                group = []
+            continue
+        name, _, pattern = ln.partition("\t")
+        name = name.rstrip()
+        marker = name[0] if name[:1] in "+-^" else ""
+        group.append([marker, name[len(marker):], pattern])
+    if group:
+        groups.append(group)
+    return groups
 
 
-def make_sig(flair, pats, sig_path, title, max_passes=6):
+def resolve_collisions(exc_path, pattern_lines):
+    """
+    Settle sigmake's collision groups. Rows sigmake already selected (told
+    apart by their references) stay selected. Among the rest, one routine
+    under several names (an identical function from other library builds,
+    or ARMCC aliases) is selected under its plainest name.
+
+    Returns (drop, ambiguous): pattern lines of genuinely ambiguous groups
+    too short to keep, which the caller removes before the next pass, and
+    those of longer ones, which sigmake keeps as nameless modules.
+    """
+    drop, ambiguous = set(), set()
+    groups = read_collisions(exc_path)
+    for group in groups:
+        open_rows = [row for row in group if not row[0]]
+        if not open_rows:
+            continue
+        best = canonical_name({row[1] for row in open_rows})
+        if best:
+            next(row for row in open_rows if row[1] == best)[0] = "+"
+            continue
+        lines = set()
+        for row in open_rows:
+            lines |= pattern_lines.get(exc_key(row[1], row[2]), set())
+        length = max((int(ln.split(" ")[3], 16) for ln in lines), default=0)
+        (drop if length < MIN_AMBIGUOUS_LENGTH else ambiguous).update(lines)
+    with open(exc_path, "w", encoding="latin-1", newline="\n") as out:
+        for group in groups:
+            for marker, name, pattern in group:
+                out.write(f"{marker}{name}\t{pattern}\n")
+            out.write("\n")
+    return drop, ambiguous
+
+
+def make_sig(flair, pats, sig_path, title):
     """
     Run sigmake, resolving collisions from its .exc file between passes.
-    Merging several library versions can surface new collision groups after
-    earlier ones are settled, so this repeats until the signature appears.
+    sigmake surfaces further collision groups once earlier ones are settled,
+    many times over when several library versions are merged, so this
+    repeats until the signature appears or a pass reports nothing new.
+
+    Patterns of the ambiguous modules kept in the signature are written to a
+    .candidates file beside it, so the loader can list what such a match
+    could be.
     """
     sig_path = Path(sig_path)
     exc = sig_path.with_suffix(".exc")
     err = sig_path.with_suffix(".err")
-    for stale in (exc, sig_path):
+    candidates = sig_path.with_suffix(".candidates")
+    for stale in (exc, sig_path, candidates):
         if stale.exists():
             stale.unlink()
+    lines = []
+    for pat in pats:
+        lines += [ln for ln in Path(pat).read_text(encoding="latin-1").splitlines() if ln != "---"]
+    by_key = {}
+    for ln in lines:
+        for key in pattern_keys(ln):
+            by_key.setdefault(key, set()).add(ln)
     # One merged pattern file keeps the command line short; hundreds of
     # library paths overflow the Windows limit.
     merged = sig_path.with_suffix(".pat")
-    with open(merged, "w", encoding="latin-1", newline="\n") as out:
-        for pat in pats:
-            for ln in Path(pat).read_text(encoding="latin-1").splitlines():
-                if ln != "---":
-                    out.write(ln + "\n")
-        out.write("---\n")
     # Processor id 13 is ARM; without it sigmake tags the file as x86.
     args = [flair_tool(flair, "sigmake"), "-p13", f"-n{title}", str(merged), str(sig_path)]
+    ambiguous, dropped = set(), set()
     r = None
-    for _ in range(max_passes):
+    rewrite = True
+    settled = None
+    while True:
+        if rewrite:
+            merged.write_text("\n".join(lines + ["---"]) + "\n", encoding="latin-1", newline="\n")
+            rewrite = False
         r = run_tool(args)
         if sig_path.is_file():
             break
         if not exc.exists():
             sys.exit(f"sigmake failed: {r.stdout}{r.stderr}")
-        resolve_collisions(exc)
-    if not sig_path.is_file():
-        sys.exit(f"sigmake still reports collisions after {max_passes} passes: {r.stdout}{r.stderr}")
+        if exc.read_bytes() == settled:
+            sys.exit(f"sigmake reports collisions that cannot be settled: {r.stdout}{r.stderr}")
+        drop, amb = resolve_collisions(exc, by_key)
+        ambiguous |= amb
+        if drop:
+            # The .exc no longer matches the pattern file once lines go, so
+            # sigmake writes a fresh one on the next pass.
+            dropped |= drop
+            lines = [ln for ln in lines if ln not in drop]
+            exc.unlink()
+            rewrite = True
+            settled = None
+        else:
+            settled = exc.read_bytes()
+    ambiguous -= dropped
+    if ambiguous:
+        candidates.write_text("\n".join(sorted(ambiguous) + ["---"]) + "\n", encoding="latin-1", newline="\n")
+    log(f"{sig_path.name}: {len(dropped)} short ambiguous patterns dropped, "
+        f"{len(ambiguous)} kept nameless")
     for f in (exc, err, merged):
         if f.exists():
             f.unlink()
+
+
+# sigmake rejects longer library names.
+MAX_TITLE = 100
+
+
+def sdk_title(versions):
+    title = "CTR-SDK " + ", ".join(versions)
+    if len(title) <= MAX_TITLE:
+        return title
+    # Versions end in their build date, which orders them.
+    ordered = sorted(versions, key=lambda v: re.findall(r"\d{8}", v)[-1:] or [v])
+    return f"CTR-SDK {ordered[0]} to {ordered[-1]} ({len(versions)} versions)"
 
 
 def main():
@@ -488,7 +658,7 @@ def main():
                 pat_dir.mkdir(parents=True, exist_ok=True)
                 pats += make_patterns(flair, libs, pat_dir)
             out = Path(args.out_dir) / "ctr_sdk.sig"
-            make_sig(flair, pats, out, "CTR-SDK " + ", ".join(versions))
+            make_sig(flair, pats, out, sdk_title(versions))
             log(f"wrote {out}")
         if args.armcc:
             pats = []
