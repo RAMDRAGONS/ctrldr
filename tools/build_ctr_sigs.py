@@ -1,29 +1,39 @@
 r"""
-Build FLIRT signatures for 3DS executables from the CTR-SDK and ARMCC packages.
+Build FLIRT signatures for 3DS executables from the CTR-SDK, ARMCC and
+middleware packages.
 
     python3 -I tools/build_ctr_sigs.py \
         --sdk  "Nintendo 3DS - CTR-SDK (World) (11_6_1-20180622).zip" \
         --sdk  "Nintendo 3DS - CTR-SDK (World) (4_2_8-20130828).zip" \
-        --armcc "Nintendo 3DS - ARM Compiler - ARMCC for Nintendo (World) (4_1_nintendo-b1454-20150227).zip"
+        --armcc "Nintendo 3DS - ARM Compiler - ARMCC for Nintendo (World) (4_1_nintendo-b1454-20150227).zip" \
+        --lib nw "Nintendo 3DS - NintendoWare for CTR (World) (3_7_6-SDK11_4_0-20170428).zip" \
+        --lib nex "Nintendo 3DS - CTR-NEX (World) (4_6_0-S1150-20180626).zip"
 
-Writes ctr_sdk.sig (the nn:: libraries and crt0) and ctr_armcc.sig (the ARM C
-and C++ runtime) to sig/arm in the IDA user directory ($IDAUSR, else
-%APPDATA%\Hex-Rays\IDA Pro on Windows or ~/.idapro elsewhere), where the
-ctrldr loader applies them. pelf and sigmake come from the FLAIR tools in
-<IDA>/tools/flair; the IDA directory is taken from --flair, $IDADIR or the
-usual install locations.
+Writes ctr_sdk.sig (the nn:: libraries and crt0), ctr_armcc.sig (the ARM C
+and C++ runtime) and one ctr_NAME.sig per --lib name to sig/arm in the IDA
+user directory ($IDAUSR, else %APPDATA%\Hex-Rays\IDA Pro on Windows or
+~/.idapro elsewhere), where the ctrldr loader applies them. pelf and sigmake
+come from the FLAIR tools in <IDA>/tools/flair; the IDA directory is taken
+from --flair, $IDADIR or the usual install locations.
 
 --sdk takes a No-Intro CTR-SDK zip, the CTR_SDK-*.zip inside it, an SDK
-tarball, or an extracted CTR_SDK directory. --armcc takes a No-Intro ARMCC zip, the zip or
-MSI inside it, or an extracted ARMCC directory (the one holding lib/armlib).
-Unpacking an ARMCC MSI needs the full 7-Zip (7z or 7zz; --sevenzip to override). Every option may repeat; patterns from all
-inputs are merged, and a function that is identical across versions keeps
-its name. Byte-identical functions under different names are dropped when
-short; longer ones stay as nameless modules (unknown_libname in IDA) and
-their candidate names go to ctr_*.candidates beside the signatures.
+tarball, or an extracted CTR_SDK directory. --armcc takes a No-Intro ARMCC
+zip, the zip or MSI inside it, or an extracted ARMCC directory (the one
+holding lib/armlib). Unpacking an ARMCC MSI needs the full 7-Zip (7z or 7zz;
+--sevenzip to override). --lib takes a name and any package laid out like
+the SDK (NintendoWare, CTR-NEX, CTR-Pia, nlib, the CTR_MW middleware): its
+CTR-TS.Process.MPCore release libraries are used, sample programs excepted.
+
+Every option may repeat, and packages given the same --lib name share one
+signature; patterns from all inputs are merged, and a function that is
+identical across versions keeps its name. Byte-identical functions under
+different names are dropped when short; longer ones stay as nameless
+modules (unknown_libname in IDA) and their candidate names go to
+ctr_*.candidates beside the signatures.
 """
 
 import argparse
+from collections import Counter
 import fnmatch
 import glob
 import os
@@ -39,6 +49,27 @@ import zipfile
 from pathlib import Path
 
 SDK_LIB_DIR = "libraries/CTR-TS.Process.MPCore/release/"
+# Middleware packages (NintendoWare, CTR-NEX, Pia, nlib, ...) follow the SDK
+# build layout under their own roots.
+RELEASE_LIB_DIR = "/ctr-ts.process.mpcore/release/"
+# Sample programs build their own copies of libraries; matched against
+# paths that include the names of nested archives.
+SAMPLE_PATH = re.compile(r"sampledemo|/samples?/|/demos?/|[-_]demos?[-_./]", re.I)
+ARCHIVE_SUFFIXES = (".zip", ".7z", ".tgz", ".tar.gz", ".tar")
+# The product a library belongs to, from the package root nearest to it.
+FAMILY_MARKERS = [
+    ("sdk", re.compile(r"(?:^|/)ctr[_-]sdk[^/]*/", re.I)),
+    ("nw", re.compile(r"(?:^|/)(?:nintendoware|nw_ctr|nw4c)[^/]*/", re.I)),
+    ("nex", re.compile(r"(?:^|/)ctr_nex[^/]*/", re.I)),
+    ("pia", re.compile(r"(?:^|/)ctr_pia[^/]*/", re.I)),
+    ("nlib", re.compile(r"(?:^|/)nlib[^/]*/", re.I)),
+    ("mw", re.compile(r"(?:^|/)ctr_mw-[^/]*/", re.I)),
+]
+FAMILY_PRODUCTS = {
+    "sdk": "CTR-SDK", "nw": "NintendoWare", "nex": "CTR-NEX", "pia": "CTR-Pia",
+    "nlib": "nlib", "mw": "CTR middleware",
+}
+LIB_NAME = re.compile(r"[A-Za-z0-9_]+")
 
 # armlib/cpplib variants for an ARMv5TE+ little-endian, non-PIC, 16-bit
 # wchar_t target, which is what armlink picks for --cpu MPCore. The suffix
@@ -142,60 +173,216 @@ def open_nested_zip(path, work):
     return z
 
 
-def extract_matching(z, predicate, dest):
-    out = []
-    for info in z.infolist():
-        if info.is_dir() or not predicate(info.filename):
-            continue
-        target = Path(dest) / Path(info.filename).name
-        with z.open(info) as src, open(target, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        out.append(target)
-    return out
+def unique_target(dest, name):
+    """dest/name, numbered when packages ship same-named libraries in several modules."""
+    target = Path(dest) / name
+    n = 1
+    while target.exists():
+        n += 1
+        target = Path(dest) / f"{Path(name).stem}_{n}{Path(name).suffix}"
+    return target
 
 
-def sdk_libraries(src, work):
-    """Copy the release MPCore libraries and crt0 objects of one SDK into work."""
-    dest = Path(work)
-    dest.mkdir(parents=True, exist_ok=True)
+def is_archive(name):
+    return name.lower().endswith(ARCHIVE_SUFFIXES)
 
-    def wanted(name):
-        n = name.replace("\\", "/")
-        i = n.find(SDK_LIB_DIR)
-        if i < 0:
-            return False
-        leaf = n[i + len(SDK_LIB_DIR):]
-        return "/" not in leaf and (leaf.endswith(".a") or leaf.startswith("crt0"))
 
-    p = Path(src)
-    if p.is_dir():
-        files = [f for f in p.rglob("*") if f.is_file() and wanted(str(f))]
-        for f in files:
-            shutil.copy2(f, dest / f.name)
-        return sorted(dest / f.name for f in files)
-    if tarfile.is_tarfile(p):
+class PackageWalker:
+    """
+    Copy files out of a package: a directory, zip, tarball or 7z archive,
+    descending into the archives nested in it. Each file is identified by a
+    path that runs through the names of the archives holding it.
+    """
+
+    def __init__(self, work, sevenzip):
+        self.work = Path(work)
+        self.sevenzip = sevenzip
+        self.nested = self.work / "nested"
+
+    def collect(self, src, wanted, dest):
+        """[(path, copied file)] for the files of src that wanted(path) accepts."""
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        self.nested.mkdir(parents=True, exist_ok=True)
         out = []
-        with tarfile.open(p) as t:
+        self._walk(Path(src), "", wanted, dest, out)
+        return sorted(out)
+
+    def _walk(self, src, prefix, wanted, dest, out):
+        if src.is_dir():
+            for f in sorted(src.rglob("*")):
+                if f.is_file():
+                    self._file(prefix + f.relative_to(src).as_posix(), f, wanted, dest, out)
+        elif zipfile.is_zipfile(src):
+            self._zip(src, prefix, wanted, dest, out)
+        elif src.name.lower().endswith(".7z"):
+            self._sevenzip(src, prefix, wanted, dest, out)
+        elif tarfile.is_tarfile(src):
+            self._tar(src, prefix, wanted, dest, out)
+        else:
+            log(f"not an archive: {prefix or src}")
+
+    def _wants_archive(self, path):
+        return is_archive(path) and not SAMPLE_PATH.search("/" + path)
+
+    def _file(self, path, f, wanted, dest, out):
+        if wanted(path):
+            target = unique_target(dest, f.name)
+            shutil.copy2(f, target)
+            out.append((path, target))
+        elif self._wants_archive(path):
+            self._walk(f, path + "/", wanted, dest, out)
+
+    def _descend(self, path, opener, wanted, dest, out):
+        """Unpack a nested archive to disk and walk it; seeking within a
+        compressed member would restart decompression for every read."""
+        tmp = unique_target(self.nested, Path(path).name)
+        with opener() as fsrc, open(tmp, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst, 1 << 20)
+        try:
+            self._walk(tmp, path + "/", wanted, dest, out)
+        finally:
+            tmp.unlink()
+
+    def _zip(self, src, prefix, wanted, dest, out):
+        with zipfile.ZipFile(src) as z:
+            for info in z.infolist():
+                if info.is_dir():
+                    continue
+                path = prefix + info.filename.replace("\\", "/")
+                if wanted(path):
+                    target = unique_target(dest, Path(path).name)
+                    with z.open(info) as fsrc, open(target, "wb") as fdst:
+                        shutil.copyfileobj(fsrc, fdst)
+                    out.append((path, target))
+                elif self._wants_archive(path):
+                    self._descend(path, lambda i=info: z.open(i), wanted, dest, out)
+
+    def _tar(self, src, prefix, wanted, dest, out):
+        with tarfile.open(src) as t:
             for m in t:
-                if m.isfile() and wanted(m.name):
-                    target = dest / Path(m.name).name
+                if not m.isfile():
+                    continue
+                path = prefix + m.name
+                if wanted(path):
+                    target = unique_target(dest, Path(path).name)
                     with t.extractfile(m) as fsrc, open(target, "wb") as fdst:
                         shutil.copyfileobj(fsrc, fdst)
-                    out.append(target)
-        return sorted(out)
-    z = open_nested_zip(p, dest.parent)
-    try:
-        return sorted(extract_matching(z, wanted, dest))
-    finally:
-        z.close()
-        if Path(z.filename).parent == dest.parent:
-            Path(z.filename).unlink()
+                    out.append((path, target))
+                elif self._wants_archive(path):
+                    self._descend(path, lambda m=m: t.extractfile(m), wanted, dest, out)
+
+    def _sevenzip(self, src, prefix, wanted, dest, out):
+        if not self.sevenzip:
+            sys.exit(f"7-Zip is required to read {src}; install it or pass --sevenzip")
+        listing = subprocess.run([self.sevenzip, "l", "-slt", "-ba", str(src)], check=True,
+                                 capture_output=True, text=True, errors="replace").stdout
+        members, path, is_dir = [], None, False
+        for line in listing.splitlines() + [""]:
+            if line.startswith("Path = "):
+                path = line[7:].replace("\\", "/")
+            elif line.startswith("Folder = "):
+                is_dir = line.endswith("+")
+            elif not line.strip() and path is not None:
+                if not is_dir:
+                    members.append(path)
+                path, is_dir = None, False
+        picked = [m for m in members
+                  if wanted(prefix + m) or self._wants_archive(prefix + m)]
+        if not picked:
+            return
+        tmp = Path(tempfile.mkdtemp(dir=self.nested))
+        try:
+            names = tmp / "names.txt"
+            names.write_text("\n".join(picked) + "\n", encoding="utf-8")
+            tree = tmp / "tree"
+            subprocess.run([self.sevenzip, "x", "-y", "-scsUTF-8", f"-o{tree}", f"-i@{names}",
+                            str(src)], check=True, stdout=subprocess.DEVNULL)
+            for m in picked:
+                f = tree / m
+                if f.is_file():
+                    self._file(prefix + m, f, wanted, dest, out)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def release_library(path, lib_dir=RELEASE_LIB_DIR):
+    """Whether path is a library straight inside a CTR-TS.Process.MPCore release directory."""
+    n = "/" + path
+    i = n.lower().find(lib_dir)
+    if i < 0 or SAMPLE_PATH.search(n[:i + 1]):
+        return False
+    return "/" not in n[i + len(lib_dir):]
+
+
+def sdk_libraries(walker, src, work):
+    """The release MPCore libraries and crt0 objects of one SDK."""
+    def wanted(path):
+        leaf = path.rsplit("/", 1)[-1]
+        return release_library(path, "/" + SDK_LIB_DIR.lower()) and (
+            leaf.endswith(".a") or leaf.startswith("crt0"))
+
+    return [f for _, f in walker.collect(src, lambda p: wanted(p.lower()), work)]
+
+
+def package_libraries(walker, src, work):
+    """The release MPCore libraries of a middleware package, samples excepted."""
+    return [f for _, f in walker.collect(
+        src, lambda p: release_library(p) and p.endswith(".a"), work)]
+
+
+def library_family(path):
+    """The family whose package root is nearest to the library, or None."""
+    best, pos = None, -1
+    for name, marker in FAMILY_MARKERS:
+        for m in marker.finditer(path):
+            if m.start() > pos:
+                best, pos = name, m.start()
+    return best
+
+
+def bundle_libraries(walker, src, work):
+    """
+    Every release MPCore library in a bundle of packages, grouped by family
+    and by the innermost archive holding it: {family: {package: [file]}}.
+    The crt0 objects count when they sit in an SDK.
+    """
+    def wanted(path):
+        leaf = path.rsplit("/", 1)[-1].lower()
+        return release_library(path) and (leaf.endswith(".a") or
+                                           (leaf.startswith("crt0") and library_family(path) == "sdk"))
+
+    found, unknown = {}, []
+    for path, f in walker.collect(src, wanted, work):
+        family = library_family(path)
+        if family is None:
+            unknown.append(path)
+            f.unlink()
+            continue
+        parts = path.split("/")
+        archives = [x for x in parts[:-1] if is_archive(x)]
+        package = archives[-1] if archives else Path(src).name
+        found.setdefault(family, {}).setdefault(package, []).append(f)
+    if unknown:
+        log(f"{Path(src).name}: {len(unknown)} libraries of no known product skipped, "
+            f"such as {unknown[0]}; give such packages with --lib")
+    return found
+
+
+def package_version(src):
+    """The last parenthesised part of a No-Intro name, else the file name."""
+    name = Path(src).name
+    groups = re.findall(r"\(([^()]*)\)", name)
+    if groups:
+        return groups[-1]
+    return re.sub(r"(\.(zip|7z|tgz|tar\.gz|tar))$", "", name, flags=re.I)
 
 
 def sdk_version(src):
-    name = Path(src).name
-    m = re.search(r"(\d+_\d+_\d+(?:-\d{8})?)", name) or re.search(r"(SNAPSHOT-\d{8})", name)
-    return m.group(1) if m else Path(src).stem
+    name = re.sub(r"\.(zip|7z|tgz|tar\.gz|tar)$", "", Path(src).name, flags=re.I)
+    m = (re.search(r"(\d+_\d+(?:_\d+)?(?:-\d{8})?)", name) or re.search(r"(SNAPSHOT-\d{8})", name)
+         or re.search(r"(\d+(?:\.\d+)+)", name))
+    return m.group(1) if m else package_version(src)
 
 
 # ARMCC MSI unpacking
@@ -274,7 +461,9 @@ def unpack_msi(msi, dest, sevenzip):
     tree = Path(dest) / "tree"
     for p in (streams, cabs, tree):
         p.mkdir(parents=True, exist_ok=True)
-    subprocess.run([sevenzip, "x", "-y", f"-o{streams}", str(msi)], check=True,
+    # Without the type, 7-Zip opens an MSI holding one cabinet as that
+    # cabinet and hides the tables.
+    subprocess.run([sevenzip, "x", "-y", "-tCompound", f"-o{streams}", str(msi)], check=True,
                    stdout=subprocess.DEVNULL)
     for cab in streams.glob("*.cab"):
         subprocess.run([sevenzip, "x", "-y", f"-o{cabs}", str(cab)], check=True,
@@ -339,10 +528,6 @@ MIN_DEFINED_BYTES = 10
 # _printf$int$ll); every variant is the same routine as far as naming goes.
 # $Sub$$ and Image$$ style linker names do not match.
 VARIANT_SUFFIX = re.compile(r"^([A-Za-z_][^$]*)\$[A-Za-z]\w*(?:\$\w+)*$")
-# Byte-identical functions under different names are kept, nameless, only
-# when long enough that game code is unlikely to share the bytes; short
-# accessors otherwise turn every matching game function into library code.
-MIN_AMBIGUOUS_LENGTH = 32
 
 
 def base_symbol(name):
@@ -448,10 +633,13 @@ def alias_base(name):
     ARMCC exports C runtime entry points under several spellings: __ARM_x and
     __x, __softfp_x and x, or x, _x and the printf/scanf feature levels
     __0x, __1x, __2x and __c89x. C++ constructors and destructors come as
-    complete and base object variants (C1/C2, D1/D2) with identical code.
+    complete and base object variants (C1/C2, D1/D2) with identical code, and
+    SDK versions move functions in and out of the CTR namespace
+    (nn::os::GetAppMemorySize, nn::os::CTR::GetAppMemorySize).
     """
     if name.startswith("_Z"):
-        return re.sub(r"(?<=[A-Za-z_])([CD])[0-2]E", r"\1E", name)
+        name = re.sub(r"(?<=[A-Za-z_])([CD])[0-2]E", r"\1E", name)
+        return re.sub(r"(?<!\d)3CTR(?=\d)", "", name)
     return re.sub(r"^(__ARM_|__softfp_|__\d|__c89|_+)", "", name)
 
 
@@ -469,13 +657,16 @@ def mangled_path(name):
     return parts if pos < len(name) and name[pos] == "E" and parts else None
 
 
-def canonical_name(names):
+def canonical_name(names, counts=None):
     """
     The name to keep when every candidate is one function: aliases as above,
     or a C++ method next to the C API wrapper the SDK builds from it
     (nndbgPanic for nn::dbg::Panic), where the mangled name is kept for its
-    types. None when the names are different functions.
+    types. Among aliases the one most library versions use wins, then the
+    shortest. None when the names are different functions.
     """
+    counts = counts or {}
+    names = set(names)
     mangled = {n for n in names if n.startswith("_Z")}
     plain = names - mangled
     if mangled and plain:
@@ -489,7 +680,7 @@ def canonical_name(names):
         names = mangled
     elif len({alias_base(n) for n in names}) != 1:
         return None
-    return min(names, key=lambda n: (len(n), n))
+    return min(names, key=lambda n: (-counts.get(n, 0), len(n), n))
 
 
 def read_collisions(exc_path):
@@ -515,41 +706,58 @@ def read_collisions(exc_path):
     return groups
 
 
-def resolve_collisions(exc_path, pattern_lines):
+def collision_group_key(group):
+    return tuple(sorted((name, pattern) for _, name, pattern in group))
+
+
+def resolve_collisions(exc_path, pattern_lines, failed):
     """
     Settle sigmake's collision groups. Rows sigmake already selected (told
     apart by their references) stay selected. Among the rest, one routine
     under several names (an identical function from other library builds,
     or ARMCC aliases) is selected under its plainest name.
 
-    Returns (drop, ambiguous): pattern lines of genuinely ambiguous groups
-    too short to keep, which the caller removes before the next pass, and
-    those of longer ones, which sigmake keeps as nameless modules.
+    sigmake lists a group again, in the .exc it extends, when a selection
+    in it cannot be built after all; such groups go into failed and lose
+    every selection from then on.
+
+    Returns the pattern lines of the genuinely ambiguous groups, which
+    sigmake keeps as nameless modules for the loader to settle.
     """
-    drop, ambiguous = set(), set()
-    groups = read_collisions(exc_path)
+    ambiguous = set()
+    groups, seen = [], set()
+    for group in read_collisions(exc_path):
+        key = collision_group_key(group)
+        if key in seen:
+            failed.add(key)
+            continue
+        seen.add(key)
+        groups.append(group)
     for group in groups:
-        open_rows = [row for row in group if not row[0]]
-        if not open_rows:
-            continue
-        best = canonical_name({row[1] for row in open_rows})
-        if best:
-            next(row for row in open_rows if row[1] == best)[0] = "+"
-            continue
-        lines = set()
+        if collision_group_key(group) in failed:
+            for row in group:
+                row[0] = ""
+            open_rows = group
+        else:
+            open_rows = [row for row in group if not row[0]]
+            if not open_rows:
+                continue
+            best = canonical_name({row[1] for row in open_rows},
+                                  Counter(row[1] for row in open_rows))
+            if best:
+                next(row for row in open_rows if row[1] == best)[0] = "+"
+                continue
         for row in open_rows:
-            lines |= pattern_lines.get(exc_key(row[1], row[2]), set())
-        length = max((int(ln.split(" ")[3], 16) for ln in lines), default=0)
-        (drop if length < MIN_AMBIGUOUS_LENGTH else ambiguous).update(lines)
+            ambiguous |= pattern_lines.get(exc_key(row[1], row[2]), set())
     with open(exc_path, "w", encoding="latin-1", newline="\n") as out:
         for group in groups:
             for marker, name, pattern in group:
                 out.write(f"{marker}{name}\t{pattern}\n")
             out.write("\n")
-    return drop, ambiguous
+    return ambiguous
 
 
-def make_sig(flair, pats, sig_path, title):
+def make_sig(flair, pats, sig_path, title, pat_versions=None):
     """
     Run sigmake, resolving collisions from its .exc file between passes.
     sigmake surfaces further collision groups once earlier ones are settled,
@@ -558,18 +766,36 @@ def make_sig(flair, pats, sig_path, title):
 
     Patterns of the ambiguous modules kept in the signature are written to a
     .candidates file beside it, so the loader can list what such a match
-    could be.
+    could be. pat_versions maps pattern files to the library version they
+    come from; with more than one version, the candidates carry the versions
+    holding them, and a .versions file lists every function whose code
+    differs between versions, from which the loader tells which version a
+    program links.
     """
     sig_path = Path(sig_path)
     exc = sig_path.with_suffix(".exc")
     err = sig_path.with_suffix(".err")
     candidates = sig_path.with_suffix(".candidates")
-    for stale in (exc, sig_path, candidates):
+    versions_index = sig_path.with_suffix(".versions")
+    for stale in (exc, sig_path, candidates, versions_index):
         if stale.exists():
             stale.unlink()
-    lines = []
+    lines, line_versions = [], {}
     for pat in pats:
-        lines += [ln for ln in Path(pat).read_text(encoding="latin-1").splitlines() if ln != "---"]
+        version = (pat_versions or {}).get(str(pat))
+        for ln in Path(pat).read_text(encoding="latin-1").splitlines():
+            if ln == "---":
+                continue
+            lines.append(ln)
+            if version is not None:
+                line_versions.setdefault(ln, set()).add(version)
+    multi_version = len({v for vs in line_versions.values() for v in vs}) > 1
+
+    def tagged(ln):
+        if not multi_version or ln not in line_versions:
+            return ln
+        return ln + "\t" + "|".join(sorted(line_versions[ln]))
+
     by_key = {}
     for ln in lines:
         for key in pattern_keys(ln):
@@ -579,14 +805,10 @@ def make_sig(flair, pats, sig_path, title):
     merged = sig_path.with_suffix(".pat")
     # Processor id 13 is ARM; without it sigmake tags the file as x86.
     args = [flair_tool(flair, "sigmake"), "-p13", f"-n{title}", str(merged), str(sig_path)]
-    ambiguous, dropped = set(), set()
-    r = None
-    rewrite = True
+    merged.write_text("\n".join(lines + ["---"]) + "\n", encoding="latin-1", newline="\n")
+    ambiguous, failed = set(), set()
     settled = None
     while True:
-        if rewrite:
-            merged.write_text("\n".join(lines + ["---"]) + "\n", encoding="latin-1", newline="\n")
-            rewrite = False
         r = run_tool(args)
         if sig_path.is_file():
             break
@@ -594,23 +816,21 @@ def make_sig(flair, pats, sig_path, title):
             sys.exit(f"sigmake failed: {r.stdout}{r.stderr}")
         if exc.read_bytes() == settled:
             sys.exit(f"sigmake reports collisions that cannot be settled: {r.stdout}{r.stderr}")
-        drop, amb = resolve_collisions(exc, by_key)
-        ambiguous |= amb
-        if drop:
-            # The .exc no longer matches the pattern file once lines go, so
-            # sigmake writes a fresh one on the next pass.
-            dropped |= drop
-            lines = [ln for ln in lines if ln not in drop]
-            exc.unlink()
-            rewrite = True
-            settled = None
-        else:
-            settled = exc.read_bytes()
-    ambiguous -= dropped
+        ambiguous |= resolve_collisions(exc, by_key, failed)
+        settled = exc.read_bytes()
     if ambiguous:
-        candidates.write_text("\n".join(sorted(ambiguous) + ["---"]) + "\n", encoding="latin-1", newline="\n")
-    log(f"{sig_path.name}: {len(dropped)} short ambiguous patterns dropped, "
-        f"{len(ambiguous)} kept nameless")
+        candidates.write_text("\n".join([tagged(ln) for ln in sorted(ambiguous)] + ["---"]) + "\n",
+                              encoding="latin-1", newline="\n")
+    log(f"{sig_path.name}: {len(ambiguous)} ambiguous patterns kept nameless")
+    if multi_version:
+        variants = {}
+        for ln in line_versions:
+            for name in pattern_names(ln):
+                variants.setdefault(name, set()).add(ln)
+        changed = sorted({ln for lns in variants.values() if len(lns) > 1 for ln in lns})
+        versions_index.write_text("\n".join([tagged(ln) for ln in changed] + ["---"]) + "\n",
+                                  encoding="latin-1", newline="\n")
+        log(f"{sig_path.name}: {len(changed)} version-specific patterns indexed")
     for f in (exc, err, merged):
         if f.exists():
             f.unlink()
@@ -620,26 +840,61 @@ def make_sig(flair, pats, sig_path, title):
 MAX_TITLE = 100
 
 
-def sdk_title(versions):
-    title = "CTR-SDK " + ", ".join(versions)
+def package_title(product, versions):
+    title = f"{product} " + ", ".join(versions)
     if len(title) <= MAX_TITLE:
         return title
-    # Versions end in their build date, which orders them.
-    ordered = sorted(versions, key=lambda v: re.findall(r"\d{8}", v)[-1:] or [v])
-    return f"CTR-SDK {ordered[0]} to {ordered[-1]} ({len(versions)} versions)"
+    # Most versions end in their build date, which orders them.
+    dated = sorted((re.findall(r"\d{8}", v)[-1], v) for v in versions if re.search(r"\d{8}", v))
+    if dated:
+        title = f"{product} {dated[0][1]} to {dated[-1][1]} ({len(versions)} versions)"
+        if len(title) <= MAX_TITLE:
+            return title
+    return f"{product} ({len(versions)} versions)"
+
+
+def build_family_sig(flair, name, entries, work, out_dir):
+    """Patterns from every (version, libraries) entry of one family, merged into ctr_<name>.sig."""
+    product = FAMILY_PRODUCTS.get(name, name)
+    pats, versions, pat_versions = [], [], {}
+    for i, (version, libs) in enumerate(entries):
+        versions.append(version)
+        if not libs:
+            log(f"{product} {version}: no CTR-TS.Process.MPCore release libraries found")
+            continue
+        log(f"{product} {version}: {len(libs)} libraries")
+        pat_dir = work / f"{name}-{i}" / "pat"
+        pat_dir.mkdir(parents=True, exist_ok=True)
+        new = make_patterns(flair, libs, pat_dir)
+        pat_versions.update((str(pat), version) for pat in new)
+        pats += new
+    if not pats:
+        log(f"{product}: nothing to build")
+        return
+    out = Path(out_dir) / f"ctr_{name}.sig"
+    make_sig(flair, pats, out, package_title(product, sorted(set(versions), key=versions.index)),
+             pat_versions)
+    log(f"wrote {out}")
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sdk", action="append", default=[], help="CTR-SDK zip or directory")
     ap.add_argument("--armcc", action="append", default=[], help="ARMCC zip, MSI or directory")
+    ap.add_argument("--lib", nargs=2, action="append", default=[], metavar=("NAME", "PACKAGE"),
+                    help="middleware package for ctr_NAME.sig")
+    ap.add_argument("--bundle", action="append", default=[], metavar="PACKAGE",
+                    help="archive or directory of several packages, sorted by product")
     ap.add_argument("--out-dir", default=default_sig_dir())
     ap.add_argument("--flair", help="directory holding pelf and sigmake")
     ap.add_argument("--sevenzip", help="7-Zip executable, for ARMCC MSI packages")
     ap.add_argument("--work-dir", help="keep intermediate files here instead of a temp dir")
     args = ap.parse_args()
-    if not args.sdk and not args.armcc:
-        ap.error("give at least one --sdk or --armcc")
+    if not (args.sdk or args.armcc or args.lib or args.bundle):
+        ap.error("give at least one --sdk, --armcc, --lib or --bundle")
+    for name, _ in args.lib:
+        if not LIB_NAME.fullmatch(name) or name.lower() == "armcc":
+            ap.error(f"--lib name {name!r}: use letters, digits and _, other than armcc")
     flair = find_flair(args.flair)
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -647,30 +902,41 @@ def main():
     work = Path(args.work_dir or work_ctx.name)
     work.mkdir(parents=True, exist_ok=True)
     try:
-        if args.sdk:
-            pats, versions = [], []
-            for i, sdk in enumerate(args.sdk):
-                version = sdk_version(sdk)
-                versions.append(version)
-                libs = sdk_libraries(sdk, work / f"sdk{i}" / "lib")
-                log(f"CTR-SDK {version}: {len(libs)} libraries")
-                pat_dir = work / f"sdk{i}" / "pat"
-                pat_dir.mkdir(parents=True, exist_ok=True)
-                pats += make_patterns(flair, libs, pat_dir)
-            out = Path(args.out_dir) / "ctr_sdk.sig"
-            make_sig(flair, pats, out, sdk_title(versions))
-            log(f"wrote {out}")
+        walker = PackageWalker(work, find_sevenzip(args.sevenzip))
+        families = {}
+        n = 0
+
+        def lib_dir():
+            nonlocal n
+            n += 1
+            return work / f"pkg{n}"
+
+        for pkg in args.sdk:
+            families.setdefault("sdk", []).append(
+                (sdk_version(pkg), sdk_libraries(walker, pkg, lib_dir())))
+        for name, pkg in args.lib:
+            families.setdefault(name.lower(), []).append(
+                (package_version(pkg), package_libraries(walker, pkg, lib_dir())))
+        for pkg in args.bundle:
+            for family, packages in bundle_libraries(walker, pkg, lib_dir()).items():
+                for package, libs in packages.items():
+                    version = sdk_version(package) if family == "sdk" else package_version(package)
+                    families.setdefault(family, []).append((version, libs))
+        for name, entries in families.items():
+            build_family_sig(flair, name, entries, work, args.out_dir)
         if args.armcc:
-            pats = []
+            pats, armcc_versions = [], {}
             for i, pkg in enumerate(args.armcc):
                 root = armcc_lib_root(pkg, work / f"armcc{i}", find_sevenzip(args.sevenzip))
                 libs = armcc_libraries(root)
                 log(f"ARMCC {Path(pkg).name}: {len(libs)} libraries")
                 pat_dir = work / f"armcc{i}" / "pat"
                 pat_dir.mkdir(parents=True, exist_ok=True)
-                pats += make_patterns(flair, libs, pat_dir)
+                new = make_patterns(flair, libs, pat_dir)
+                armcc_versions.update((str(pat), package_version(pkg)) for pat in new)
+                pats += new
             out = Path(args.out_dir) / "ctr_armcc.sig"
-            make_sig(flair, pats, out, "ARMCC runtime for CTR")
+            make_sig(flair, pats, out, "ARMCC runtime for CTR", armcc_versions)
             log(f"wrote {out}")
     finally:
         if work_ctx is not None:

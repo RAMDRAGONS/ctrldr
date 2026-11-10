@@ -5,6 +5,10 @@ Such a module stands for several library functions with identical bytes, and
 IDA names its matches unknown_libname. The signature builder writes their
 pattern lines (FLAIR .pat format) to ctr_*.candidates; this matches a
 function against them the way FLIRT does and returns the names it could be.
+
+A tab after a pattern line lists the library versions holding it. The same
+format in ctr_*.versions covers every function whose code changed between
+versions, which tells what version a program links.
 """
 
 from collections import defaultdict
@@ -48,6 +52,7 @@ class Module:
     names: list
     refs: list = field(default_factory=list)   # (offset, name)
     tail: list = field(default_factory=list)
+    versions: frozenset = frozenset()
 
     def matches(self, data):
         """data holds at least the bytes of the function from its start."""
@@ -62,6 +67,7 @@ class Module:
 
 
 def parse_line(line):
+    line, _, versions = line.partition("\t")
     tokens = line.split(" ")
     if len(tokens) < 5:
         return None
@@ -69,7 +75,8 @@ def parse_line(line):
         crc_len, crc, length = int(tokens[1], 16), int(tokens[2], 16), int(tokens[3], 16)
     except ValueError:
         return None
-    mod = Module(_parse_bytes(tokens[0]), crc_len, crc, length, [])
+    mod = Module(_parse_bytes(tokens[0]), crc_len, crc, length, [],
+                 versions=frozenset(v for v in versions.split("|") if v))
     i = 4
     while i < len(tokens):
         tok = tokens[i]
@@ -88,6 +95,16 @@ def parse_line(line):
     return mod if mod.names else None
 
 
+def read_modules(path):
+    with open(path, encoding="latin-1") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line and line != "---":
+                mod = parse_line(line)
+                if mod is not None:
+                    yield mod
+
+
 class Candidates:
     """Pattern lines from one or more .candidates files, indexed by lead word."""
 
@@ -96,20 +113,13 @@ class Candidates:
         self.wild = []
         self.count = 0
         for path in paths:
-            with open(path, encoding="latin-1") as f:
-                for line in f:
-                    line = line.rstrip("\n")
-                    if not line or line == "---":
-                        continue
-                    mod = parse_line(line)
-                    if mod is None:
-                        continue
-                    self.count += 1
-                    head = mod.lead[:4]
-                    if None in head:
-                        self.wild.append(mod)
-                    else:
-                        self.by_head[bytes(head)].append(mod)
+            for mod in read_modules(path):
+                self.count += 1
+                head = mod.lead[:4]
+                if None in head:
+                    self.wild.append(mod)
+                else:
+                    self.by_head[bytes(head)].append(mod)
 
     def __len__(self):
         return self.count
@@ -126,3 +136,41 @@ class Candidates:
         # FLIRT consults tail bytes only to choose between modules, so a
         # match may disagree with all of them.
         return [m for m in found if m.tail_fits(data)] or found
+
+
+class VersionIndex:
+    """
+    The version-specific patterns of .versions files, by function name, for
+    working out which library versions a program was linked with.
+    """
+
+    def __init__(self, paths):
+        self.by_name = defaultdict(list)
+        for path in paths:
+            for mod in read_modules(path):
+                if mod.versions:
+                    for name in mod.names:
+                        self.by_name[name].append(mod)
+
+    @property
+    def max_length(self):
+        return max((m.length for mods in self.by_name.values() for m in mods), default=0)
+
+    def linked(self, functions, tolerance=0.9):
+        """
+        The versions a program most likely links: those whose code fits
+        nearly as many of its named, version-specific functions as the best
+        one. functions yields (name, bytes from its start).
+        """
+        scores = defaultdict(int)
+        for name, data in functions:
+            fits = set()
+            for m in self.by_name.get(name, ()):
+                if m.matches(data):
+                    fits |= m.versions
+            for v in fits:
+                scores[v] += 1
+        if not scores:
+            return set()
+        best = max(scores.values())
+        return {v for v, n in scores.items() if n >= best * tolerance}

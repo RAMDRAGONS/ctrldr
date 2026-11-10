@@ -3,6 +3,8 @@ Passes that need IDA's analysis results (functions, instructions), run once
 auto-analysis has settled.
 """
 
+import bisect
+import os
 import re
 import struct
 from collections import Counter
@@ -21,7 +23,7 @@ import ida_ua
 import ida_xref
 import idautils
 
-from .flirt import Candidates
+from .flirt import Candidates, VersionIndex
 from .svc import SEND_SYNC_REQUEST_NAMES, SVC_NAMES
 
 BADADDR = ida_idaapi.BADADDR
@@ -288,33 +290,160 @@ def _pick_by_context(names, context):
     return winners[0] if top >= MIN_SCOPE_MATCH and len(winners) == 1 else None
 
 
-def resolve_unknown_libnames(paths):
+def linked_versions(paths):
     """
-    List the possible names of each unknown_libname function in its comment,
-    and rename it when the library functions around it point to exactly one.
-    Returns (functions annotated, functions renamed).
+    The library versions the program appears to link, voted on by the code
+    of the functions FLIRT has named. Each library votes on its own versions,
+    as the SDK's far larger function count would otherwise outvote the rest.
+    """
+    named = [(ea, _plain(ida_name.get_name(ea))) for ea in idautils.Functions()
+             if ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB
+             and not ida_name.get_name(ea).startswith(UNKNOWN_LIBNAME)]
+    linked = set()
+    for path in paths:
+        index = VersionIndex([path])
+        span = index.max_length
+        if span:
+            linked |= index.linked((name, ida_bytes.get_bytes(ea, span) or b"")
+                                   for ea, name in named if name in index.by_name)
+    return linked
+
+
+def resolve_unknown_libnames(paths, versions=frozenset()):
+    """
+    Settle each unknown_libname function: rename it when one candidate name
+    remains, after keeping only the candidates from the library versions the
+    program links when that leaves any, or when the library functions around
+    it point to exactly one; otherwise list the candidates in its comment. A
+    short match with no library code around it is game code that shares a
+    library accessor's bytes, and goes back to being an ordinary function.
+    Returns (functions annotated, functions renamed, matches undone).
     """
     cands = Candidates(paths)
-    if not len(cands):
-        return 0, 0
     span = cands.max_length
-    annotated = renamed = 0
+    annotated = renamed = undone = 0
     for ea in list(idautils.Functions()):
         if not ida_name.get_name(ea).startswith(UNKNOWN_LIBNAME):
             continue
         f = ida_funcs.get_func(ea)
-        data = ida_bytes.get_bytes(ea, span) or b""
-        names = sorted({n for m in cands.match(data) if _refs_agree(ea, m) for n in m.names})
-        if not names:
-            continue
-        shown = sorted({ida_name.demangle_name(n, ida_name.MNG_SHORT_FORM) or n for n in names})
-        lines = shown[:MAX_LISTED_CANDIDATES]
-        if len(shown) > MAX_LISTED_CANDIDATES:
-            lines.append(f"... {len(shown) - MAX_LISTED_CANDIDATES} more")
-        ida_funcs.set_func_cmt(f, "FLIRT candidates:\n" + "\n".join(lines), False)
-        annotated += 1
-        pick = names[0] if len(names) == 1 else _pick_by_context(names, _context_names(f))
+        data = (ida_bytes.get_bytes(ea, span) if span else None) or b""
+        mods = [m for m in cands.match(data) if _refs_agree(ea, m)]
+        in_version = [m for m in mods if m.versions & versions]
+        names = sorted({n for m in (in_version or mods) for n in m.names})
+        context = _context_names(f)
+        pick = names[0] if len(names) == 1 else _pick_by_context(names, context)
         if pick:
             _set_name(ea, _unique_name(pick))
             renamed += 1
-    return annotated, renamed
+        elif f.size() < SHORT_MATCH and not context:
+            _undo_library_match(ea)
+            undone += 1
+            continue
+        if len(names) > 1:
+            shown = sorted({ida_name.demangle_name(n, ida_name.MNG_SHORT_FORM) or n for n in names})
+            lines = shown[:MAX_LISTED_CANDIDATES]
+            if len(shown) > MAX_LISTED_CANDIDATES:
+                lines.append(f"... {len(shown) - MAX_LISTED_CANDIDATES} more")
+            ida_funcs.set_func_cmt(f, "FLIRT candidates:\n" + "\n".join(lines), False)
+            annotated += 1
+    return annotated, renamed, undone
+
+
+# A middleware library that is really linked matches a good number of
+# substantial functions; one that is not only hits scattered short code that
+# happens to share its bytes.
+LARGE_MATCH = 64
+MIN_LARGE_MATCHES = 3
+# Short matches stand only next to, or in a call with, another function of
+# the same library, as the linker keeps a library's objects together.
+SHORT_MATCH = 32
+
+
+def _starts_function(ea):
+    f = ida_funcs.get_func(ea)
+    return f is not None and f.start_ea == ea
+
+
+def _undo_library_match(ea):
+    f = ida_funcs.get_func(ea)
+    ida_name.set_name(ea, "", ida_name.SN_NOWARN)
+    if f:
+        f.flags &= ~ida_funcs.FUNC_LIB
+        ida_funcs.update_func(f)
+
+
+def _has_family_company(ea, family, starts):
+    """Whether another match of the same signature is nearby, calls ea or is called by it."""
+    i = bisect.bisect_left(starts, ea)
+    for j in (i - 1, i + 1):
+        if 0 <= j < len(starts) and abs(starts[j] - ea) <= NEIGHBOUR_RANGE:
+            return True
+    for ref in idautils.CodeRefsTo(ea, False):
+        caller = ida_funcs.get_func(ref)
+        if caller and caller.start_ea in family:
+            return True
+    for item in idautils.FuncItems(ea):
+        for ref in idautils.CodeRefsFrom(item, False):
+            callee = ida_funcs.get_func(ref)
+            if callee and callee.start_ea != ea and callee.start_ea in family:
+                return True
+    return False
+
+
+def library_functions():
+    return {ea for ea in idautils.Functions() if ida_funcs.get_func(ea).flags & ida_funcs.FUNC_LIB}
+
+
+def _apply_signature(sig, eas):
+    """Apply a signature to the given functions; returns those FLIRT deferred."""
+    deferred = []
+    for ea in eas:
+        f = ida_funcs.get_func(ea)
+        if f is None or f.start_ea != ea or f.flags & ida_funcs.FUNC_LIB or not _is_auto_named(ea):
+            continue
+        if ida_funcs.apply_idasgn_to(sig, ea, False) == ida_funcs.LIBFUNC_DELAY:
+            deferred.append(ea)
+    return deferred
+
+
+def review_matches(hits):
+    """
+    Undo the matches of one middleware signature when the program does not
+    appear to link that library, and its short matches that stand alone.
+    Returns (kept, undone).
+    """
+    # Applying a signature can reshape the function it matched.
+    hits = [ea for ea in hits if _starts_function(ea)]
+    sizes = {ea: ida_funcs.get_func(ea).size() for ea in hits}
+    if sum(1 for n in sizes.values() if n >= LARGE_MATCH) < MIN_LARGE_MATCHES:
+        undo = set(hits)
+    else:
+        family, starts = set(hits), sorted(hits)
+        undo = {ea for ea in hits
+                if sizes[ea] < SHORT_MATCH and not _has_family_company(ea, family, starts)}
+    for ea in undo:
+        _undo_library_match(ea)
+    return len(hits) - len(undo), len(undo)
+
+
+def apply_middleware_signatures(paths):
+    """
+    Apply each middleware signature to the functions still unnamed and review
+    what it named on its own. FLIRT defers a match whose references point at
+    functions without names yet, so the deferred ones get a second try once
+    every library has been through. Yields (signature, kept, undone).
+    """
+    sigs = [os.path.splitext(os.path.basename(p))[0] for p in paths]
+    deferred = {}
+    hits = {}
+    for sig in sigs:
+        before = library_functions()
+        deferred[sig] = _apply_signature(sig, list(idautils.Functions()))
+        hits[sig] = library_functions() - before
+    for sig in sigs:
+        before = library_functions()
+        _apply_signature(sig, deferred[sig])
+        hits[sig] |= library_functions() - before
+    for sig in sigs:
+        kept, undone = review_matches(hits[sig])
+        yield sig, kept, undone

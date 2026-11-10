@@ -169,6 +169,12 @@ def write_metadata(img):
         node.hashset("services", ",".join(img.exheader.services).encode())
 
 
+# The SDK and the ARM runtime are linked into every program and are applied
+# with auto-analysis. Middleware is applied afterwards, only to what they
+# left unnamed, so its copies of their small functions cannot claim them.
+CORE_SIGNATURES = ("ctr_sdk", "ctr_armcc")
+
+
 def find_signatures(ext="sig"):
     """ctr_*.<ext> in the user and IDA sig/arm directories, user copies first."""
     dirs = [os.path.join(ida_diskio.get_user_idadir(), "sig", "arm"),
@@ -184,41 +190,81 @@ def find_signatures(ext="sig"):
     return found
 
 
+def is_core_signature(path):
+    return os.path.splitext(os.path.basename(path))[0].lower() in CORE_SIGNATURES
+
+
 class PostAnalysis(ida_idp.IDB_Hooks):
     """Passes that need functions to exist, run once auto-analysis settles."""
 
-    def __init__(self, text_start, text_end):
+    def __init__(self, text_start, text_end, middleware):
         super().__init__()
         self.text = (text_start, text_end)
+        self.middleware = middleware
 
     def auto_empty_finally(self):
         self.unhook()
         if getattr(ctrldr, "_post_hook", None) is self:
             ctrldr._post_hook = None
+        from ctrldr import idapost
+        run_library_passes()
         try:
-            run_post_analysis(*self.text)
+            for sig, kept, undone in idapost.apply_middleware_signatures(self.middleware):
+                log(f"{sig}: {kept} functions named, {undone} isolated or unsupported matches undone")
         except Exception as e:  # noqa: BLE001
-            log(f"post-analysis failed: {e}")
+            log(f"middleware signatures failed: {e!r}")
+        run_library_passes()
+        run_post_analysis(*self.text)
+
+
+def run_library_passes():
+    """
+    Settle unknown_libname matches. Runs after the SDK and runtime
+    signatures and again after the middleware.
+    """
+    from ctrldr import idapost
+    try:
+        versions = idapost.linked_versions(find_signatures("versions"))
+        if versions:
+            log("library versions linked: " + ", ".join(sorted(versions)))
+        annotated, renamed, undone = idapost.resolve_unknown_libnames(
+            find_signatures("candidates"), versions)
+        if annotated or undone:
+            log(f"unknown_libname: {annotated} given FLIRT candidates, {renamed} renamed, "
+                f"{undone} short matches undone")
+    except Exception as e:  # noqa: BLE001
+        log(f"unknown_libname pass failed: {e!r}")
 
 
 def run_post_analysis(start, end):
     from ctrldr import idapost
-    annotated, renamed = idapost.resolve_unknown_libnames(find_signatures("candidates"))
-    if annotated:
-        log(f"{annotated} unknown_libname functions given FLIRT candidates, {renamed} renamed")
-    helpers, tables = idapost.setup_switch8(start, end)
-    if helpers:
-        log(f"switch8 helpers: {helpers}, tables set up: {tables}")
-    named, used = idapost.name_svc_wrappers(start, end)
-    log(f"{sum(used.values())} SVC sites ({len(used)} distinct), {named} wrappers named")
-    requests = idapost.annotate_ipc_requests(start, end)
-    log(f"{requests} IPC request functions annotated")
-    try:
-        from ctrldr import hexrays
+
+    def switch_pass():
+        helpers, tables = idapost.setup_switch8(start, end)
+        if helpers:
+            log(f"switch8 helpers: {helpers}, tables set up: {tables}")
+
+    def svc_pass():
+        named, used = idapost.name_svc_wrappers(start, end)
+        log(f"{sum(used.values())} SVC sites ({len(used)} distinct), {named} wrappers named")
+
+    def ipc_pass():
+        log(f"{idapost.annotate_ipc_requests(start, end)} IPC request functions annotated")
+
+    def hexrays_pass():
+        try:
+            from ctrldr import hexrays
+        except ImportError:
+            return
         if hexrays.install():
             log("Hex-Rays SVC/CP15/FPSCR filters installed")
-    except ImportError:
-        pass
+
+    # Each pass stands on its own, so one failing leaves the others to run.
+    for step in (switch_pass, svc_pass, ipc_pass, hexrays_pass):
+        try:
+            step()
+        except Exception as e:  # noqa: BLE001
+            log(f"{step.__name__} failed: {e!r}")
 
 
 def populate(img):
@@ -256,18 +302,22 @@ def populate(img):
     if main is not None:
         ida_ida.inf_set_main(main)
 
+    middleware = []
     if img.sdk_app or img.exheader is not None:
         sigs = find_signatures()
-        for sig in sigs:
+        core = [sig for sig in sigs if is_core_signature(sig)]
+        middleware = [sig for sig in sigs if not is_core_signature(sig)]
+        for sig in core:
             ida_funcs.plan_to_apply_idasgn(sig)
         if sigs:
-            log("queued FLIRT: " + ", ".join(os.path.basename(s) for s in sigs))
+            log("queued FLIRT: " + ", ".join(os.path.basename(s) for s in core) +
+                "; after analysis: " + (", ".join(os.path.basename(s) for s in middleware) or "none"))
         else:
             log("no ctr_*.sig under sig/arm; tools/build_ctr_sigs.py builds them from the SDK")
 
     write_metadata(img)
     text = img.sections[0]
-    hook = PostAnalysis(text.start, text.start + text.size)
+    hook = PostAnalysis(text.start, text.start + text.size, middleware)
     hook.hook()
     ctrldr._post_hook = hook
 
