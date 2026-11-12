@@ -119,6 +119,33 @@ class ArmScan:
         return calls, None
 
 
+def call_targets_in(scan, start, end):
+    """
+    BL/BLX targets from ARM code in [start, end), for seeding functions
+    before auto-analysis. A target must itself decode as an unconditional ARM
+    instruction (or a Thumb one for BLX), which rejects most stray 0xEB words
+    in literal pools. Returns (arm, thumb) target sets.
+    """
+    arm, thumb = set(), set()
+    for ea in range(start, end - 3, 4):
+        w = scan.word(ea)
+        if w is None or (w >> 24 != 0xEB and w >> 25 != 0x7D):
+            continue
+        t, _, is_thumb = ArmScan.branch_target(ea, w)
+        if not start <= t < end or t == ea + 4:
+            continue
+        if is_thumb:
+            off = t - scan.base
+            h = struct.unpack_from("<H", scan.data, off)[0] if 0 <= off < len(scan.data) - 1 else 0
+            if h and h != 0xFFFF:
+                thumb.add(t)
+        else:
+            tw = scan.word(t)
+            if tw is not None and tw >> 28 == 0xE:
+                arm.add(t)
+    return arm, thumb
+
+
 def page_code_score(words):
     """Fraction of non-zero words carrying the ARM 'always' condition."""
     nz = [w for w in words if w]
@@ -337,32 +364,7 @@ class LayoutInference:
         return ea
 
     def call_targets(self, text_end):
-        """
-        BL/BLX targets from ARM code pages, for seeding functions before
-        auto-analysis. A target must itself decode as an unconditional ARM
-        instruction (or a Thumb one for BLX), which rejects most stray 0xEB
-        words in literal pools.
-        """
-        s = self.scan
-        n = (text_end - CODE_BASE) // 4
-        arm, thumb = set(), set()
-        for i in range(n):
-            w = s.words[i]
-            top = w >> 24
-            if top != 0xEB and w >> 25 != 0x7D:
-                continue
-            t, _, is_thumb = ArmScan.branch_target(CODE_BASE + i * 4, w)
-            if not CODE_BASE <= t < text_end or t == CODE_BASE + i * 4 + 4:
-                continue
-            if is_thumb:
-                h = struct.unpack_from("<H", self.data, t - CODE_BASE)[0]
-                if h and h != 0xFFFF:
-                    thumb.add(t)
-            else:
-                tw = s.word(t)
-                if tw is not None and tw >> 28 == 0xE:
-                    arm.add(t)
-        return arm, thumb
+        return call_targets_in(self.scan, CODE_BASE, text_end)
 
     def collect_literals(self, text_end):
         """
