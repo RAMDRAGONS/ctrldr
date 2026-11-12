@@ -119,12 +119,32 @@ class ArmScan:
         return calls, None
 
 
+def is_thumb_call_pair(w):
+    """
+    Whether a word read from aligned memory is also a Thumb BL/BLX pair
+    (first halfword 11110, second 111x1). Every ARM BLX(imm) word whose low
+    halfword falls in 0xF000-0xF7FF fits, so inside Thumb code an ordinary
+    call reads as an ARM BLX to a bogus Thumb target.
+    """
+    return (w & 0xF800) == 0xF000 and (w >> 16) & 0xE800 == 0xE800
+
+
+def _thumb_push_lr(scan, t):
+    off = t - scan.base
+    if not 0 <= off < len(scan.data) - 1:
+        return False
+    return struct.unpack_from("<H", scan.data, off)[0] & 0xFF00 == 0xB500
+
+
 def call_targets_in(scan, start, end):
     """
     BL/BLX targets from ARM code in [start, end), for seeding functions
     before auto-analysis. A target must itself decode as an unconditional ARM
     instruction (or a Thumb one for BLX), which rejects most stray 0xEB words
-    in literal pools. Returns (arm, thumb) target sets.
+    in literal pools. A BLX word that is also a Thumb call pair may be Thumb
+    code, so its target must begin with PUSH {..., LR}: a wrong Thumb seed
+    makes IDA decode ARM code as Thumb, and the bad branches it decodes there
+    spread that further. Returns (arm, thumb) target sets.
     """
     arm, thumb = set(), set()
     for ea in range(start, end - 3, 4):
@@ -135,6 +155,8 @@ def call_targets_in(scan, start, end):
         if not start <= t < end or t == ea + 4:
             continue
         if is_thumb:
+            if is_thumb_call_pair(w) and not _thumb_push_lr(scan, t):
+                continue
             off = t - scan.base
             h = struct.unpack_from("<H", scan.data, off)[0] if 0 <= off < len(scan.data) - 1 else 0
             if h and h != 0xFFFF:
