@@ -27,6 +27,8 @@ class CtrldrHexraysPlugin(ida_idaapi.plugin_t):
     help = ""
     wanted_name = "ctrldr Hex-Rays filters"
     wanted_hotkey = ""
+    # IDA calls term() even when init() skipped the plugin.
+    hexrays = None
 
     def init(self):
         try:
@@ -44,7 +46,9 @@ class CtrldrHexraysPlugin(ida_idaapi.plugin_t):
         pass
 
     def term(self):
-        self.hexrays.uninstall()
+        if self.hexrays is not None:
+            self.hexrays.uninstall()
+            self.hexrays = None
 
 
 def PLUGIN_ENTRY():
