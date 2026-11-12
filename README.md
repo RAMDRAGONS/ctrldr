@@ -8,6 +8,7 @@ database from a bare `code.bin` with no manual setup.
 - ExeFS `.code` / `code.bin`, BLZ-compressed or not
 - ExeFS images (the `.code` inside is used)
 - 3DSX homebrew (relocations applied) and 3GX plugins
+- CRO modules (`romfs:/cro/*.cro` or wherever the game keeps them), see below
 
 An ExHeader is used when one sits in the same directory as the input
 (`exheader.bin`, `extheader.bin`, `exh.bin`, `<name>.exheader`). Without one,
@@ -60,6 +61,42 @@ alignment and need an ExHeader.
   `__set_FPSCR`/`__get_FPSCR`.
 - ExHeader metadata (title, program ID, stack, dependencies, services, kernel
   capabilities) as comments at the top of `.text`.
+
+## CRO modules
+
+A `.cro` is mapped with its file laid out unchanged, at address 0 by default
+(IDA asks for another base when run interactively; `--cro-base` on the command
+line), so an address minus the image base is the offset in the `.cro`, the
+offset nn::ro and decompilation projects use.
+
+- Segments `.crohdr`, `.text`, `.rodata`, `.data`, `.bss` and `.crotab` for the
+  tables; the header and every table are typed (`CroHeader`, `CroSegment`,
+  `CroPatch`, ... in `ctr_types.h`).
+- Internal relocations are applied and recorded as fixups, so the database can
+  be rebased.
+- Every import gets a slot in an `extern` segment that the patched words point
+  at, so calls through the module's `ldr pc, =...` thunks show the imported
+  name (IDA names the slot `__imp_<name>` and the thunk `<name>`). Imports from
+  code.bin are resolved through `static.crs` to their code.bin address; imports
+  from other modules to `<Module>+<file offset>` when that `.cro` sits in the
+  same directory, using its export name if it has one.
+- Named and indexed exports are named; `nnroProlog`, `nnroEpilog`,
+  `nnroUnresolved` and `nnroControlObject_` come from the header.
+- Functions are seeded from exports, code pointers in data (vtables) and
+  BL/BLX targets; what code.bin references in the module is commented with the
+  code.bin addresses that hold the pointer.
+
+`static.crs` is looked for next to the input and in a `romfs` directory beside
+it or its parent. Names for code.bin addresses can come from a symbol list:
+`CTRLDR_STATIC_SYMBOLS=<file>` or a `static.sym` / `code.sym` /
+`static_symbols.txt` next to the module, as `name = 0xADDR` lines or Ghidra
+import lists (`name 0xADDR f`). Without one, code.bin targets are named
+`static_<address>`.
+
+Loading a code.bin whose `static.crs` is found the same way adds the names
+code.bin exports to modules, names the unresolved-import stub
+`nnroUnresolved`, and comments every word nn::ro fills with an address inside
+a module (`ModuleShop+0x1234`).
 
 ## Install
 
@@ -120,4 +157,5 @@ python tools/build_ctr_sigs.py \
 
 ```
 cd loaders && python -m ctrldr path/to/code.bin [--exheader path] [--no-exheader]
+cd loaders && python -m ctrldr path/to/Module.cro [--cro-base 0x0]
 ```

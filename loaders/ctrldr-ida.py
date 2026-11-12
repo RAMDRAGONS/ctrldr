@@ -1,8 +1,8 @@
 """
 IDA 9.x loader for Nintendo 3DS executables: ExeFS .code / code.bin
 (BLZ-compressed or not, with or without an ExHeader), ExeFS images, 3DSX
-homebrew and 3GX plugins. The format parsing lives in the ctrldr package
-next to this file.
+homebrew, 3GX plugins and CRO modules. The format parsing lives in the
+ctrldr package next to this file.
 """
 
 import os
@@ -39,7 +39,7 @@ from ctrldr.consts import (  # noqa: E402
 )
 from ctrldr.util import PAGE, LoaderError, Source, align_up  # noqa: E402
 
-FORMAT_LABELS = {"code": "code.bin", "ExeFS": "ExeFS", "3DSX": "3DSX", "3GX": "3GX"}
+FORMAT_LABELS = {"code": "code.bin", "ExeFS": "ExeFS", "3DSX": "3DSX", "3GX": "3GX", "CRO": "CRO module"}
 
 
 def log(msg):
@@ -57,7 +57,7 @@ def _perm(p):
     return r
 
 
-def add_segment(start, end, name, sclass, perm, sparse=False):
+def add_segment(start, end, name, sclass, perm, sparse=False, seg_type=None):
     s = ida_segment.segment_t()
     s.start_ea = start
     s.end_ea = end
@@ -66,6 +66,8 @@ def add_segment(start, end, name, sclass, perm, sparse=False):
     s.comb = ida_segment.scPub
     s.perm = _perm(perm)
     s.sel = ida_segment.setup_selector(0)
+    if seg_type is not None:
+        s.type = seg_type
     flags = ida_segment.ADDSEG_NOSREG
     if sparse:
         flags |= ida_segment.ADDSEG_SPARSE
@@ -93,10 +95,16 @@ def setup_compiler():
         log(f"{errors} errors while parsing {header}")
 
 
-def apply_named_type(ea, name):
+def apply_named_type(ea, name, count=1):
     tif = ida_typeinf.tinfo_t()
-    if tif.get_named_type(None, name):
-        ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
+    if not tif.get_named_type(None, name):
+        return
+    if count > 1:
+        array = ida_typeinf.tinfo_t()
+        if not array.create_array(tif, count):
+            return
+        tif = array
+    ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
 
 
 def set_name(ea, name, public=True):
@@ -151,6 +159,7 @@ def describe(img):
             lines.append("Dependencies: " + ", ".join(deps))
         if exh.services:
             lines.append("Services: " + ", ".join(exh.services))
+    lines.extend(img.info)
     lines.extend("Note: " + n for n in img.notes)
     return lines
 
@@ -278,7 +287,11 @@ def populate(img):
         add_segment(s.start, end, s.name, s.sclass, s.perm, sparse=not initialized)
         if initialized:
             ida_loader.mem2base(img.data[s.file_off:s.file_off + s.size], s.start, -1)
-    map_kernel_regions(img)
+    if img.image_base is not None:
+        ida_nalt.set_imagebase(img.image_base)
+    if img.kind != "CRO":
+        map_kernel_regions(img)
+    add_externs(img)
 
     treg = ida_idp.str2reg("T")
     for ea in img.thumb:
@@ -296,6 +309,10 @@ def populate(img):
     ida_ida.inf_set_start_ip(img.entry)
     for ea, name in img.symbols.items():
         set_name(ea, name)
+    for ea, text in img.comments.items():
+        ida_bytes.set_cmt(ea, text, False)
+    for ea, name, count in img.types:
+        apply_named_type(ea, name, count)
     for ea in img.functions | img.call_targets:
         ida_auto.auto_make_proc(ea)
     main = next((ea for ea, n in img.symbols.items() if n == "nnMain"), None)
@@ -320,6 +337,20 @@ def populate(img):
     hook = PostAnalysis(text.start, text.start + text.size, middleware)
     hook.hook()
     ctrldr._post_hook = hook
+
+
+def add_externs(img):
+    """Imported symbols of a CRO: one named dword per import, which the patched words point at."""
+    if not img.externs:
+        return
+    start = img.extern_base
+    add_segment(start, start + 4 * len(img.externs), "extern", "XTRN", 4,
+                sparse=True, seg_type=ida_segment.SEG_XTRN)
+    for i, ext in enumerate(img.externs):
+        ea = start + 4 * i
+        ida_bytes.create_dword(ea, 4)
+        set_name(ea, ext.name)
+        ida_bytes.set_cmt(ea, ext.comment, True)
 
 
 def ida_fixup_data(target):
@@ -354,8 +385,14 @@ def load_file(li, neflags, format):
         return 0
     src = Source(li)
     path = _input_path()
+    cro_base = 0
+    if fmt == "CRO" and not (ida_kernwin.cvar.batch or ida_kernwin.is_ida_library()):
+        # A module has no fixed address; at 0, addresses are offsets in the .cro file.
+        chosen = ida_kernwin.ask_addr(0, "Address to map the CRO module at (0: addresses equal file offsets)")
+        if chosen is not None and chosen != ida_idaapi.BADADDR:
+            cro_base = chosen & ~0xFFF
     try:
-        img = ctrldr.load_image(src, path, fmt)
+        img = ctrldr.load_image(src, path, fmt, cro_base=cro_base)
     except LoaderError as e:
         if fmt not in ("code", "ExeFS") or ida_kernwin.cvar.batch or ida_kernwin.is_ida_library():
             raise

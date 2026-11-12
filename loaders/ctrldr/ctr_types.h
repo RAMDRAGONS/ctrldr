@@ -336,3 +336,105 @@ struct CtrSharedPage
   u8 headsetConnected;
   u8 padC1[0xF3F];
 };
+
+// nn::ro modules (CRO) and the static module description (CRS). Everything
+// the tables point at is a segment offset: (offset << 4) | segment index.
+struct CroHeader
+{
+  u32 magic;                      // "CRO0"
+  u32 nameOffset;
+  u32 next;                       // loaded module list, filled in by nn::ro
+  u32 previous;
+  u32 fileSize;
+  u32 bssSize;
+  u32 fixedSize;
+  u32 unk1C;
+  u32 controlObject;              // segment offset of nnroControlObject_
+  u32 onLoad;                     // segment offset of nnroProlog
+  u32 onExit;                     // segment offset of nnroEpilog
+  u32 onUnresolved;               // segment offset of nnroUnresolved
+  u32 codeOffset;
+  u32 codeSize;
+  u32 dataOffset;
+  u32 dataSize;
+  u32 moduleNameOffset;
+  u32 moduleNameSize;
+  u32 segmentTableOffset;
+  u32 segmentCount;
+  u32 namedExportTableOffset;
+  u32 namedExportCount;
+  u32 indexedExportTableOffset;
+  u32 indexedExportCount;
+  u32 exportStringsOffset;
+  u32 exportStringsSize;
+  u32 exportTreeOffset;
+  u32 exportTreeCount;
+  u32 importModuleTableOffset;
+  u32 importModuleCount;
+  u32 importPatchesOffset;
+  u32 importPatchCount;
+  u32 namedImportTableOffset;
+  u32 namedImportCount;
+  u32 indexedImportTableOffset;
+  u32 indexedImportCount;
+  u32 anonymousImportTableOffset;
+  u32 anonymousImportCount;
+  u32 importStringsOffset;
+  u32 importStringsSize;
+  u32 unk8Offset;
+  u32 unk8Count;
+  u32 relocationPatchesOffset;
+  u32 relocationPatchCount;
+  u32 unkPatchesOffset;
+  u32 unkPatchCount;
+};
+
+struct CroSegment
+{
+  u32 offset;                     // file offset; a CRS holds load addresses
+  u32 size;
+  u32 id;                         // 0 .text, 1 .rodata, 2 .data, 3 .bss
+};
+
+struct CroNamedExport
+{
+  u32 nameOffset;
+  u32 segmentOffset;
+};
+
+struct CroImportModule
+{
+  u32 nameOffset;
+  u32 indexedImportsOffset;
+  u32 indexedImportCount;
+  u32 anonymousImportsOffset;
+  u32 anonymousImportCount;
+};
+
+struct CroNamedImport
+{
+  u32 nameOffset;
+  u32 patchesOffset;              // first entry of this import's patch list
+};
+
+struct CroIndexedImport
+{
+  u32 exportIndex;
+  u32 patchesOffset;
+};
+
+struct CroAnonymousImport
+{
+  u32 segmentOffset;              // in the exporting module
+  u32 patchesOffset;
+};
+
+struct CroPatch
+{
+  u32 segmentOffset;              // word to patch
+  u8 type;                        // R_ARM_ABS32 (2), R_ARM_REL32 (3), ...
+  u8 segmentOrLast;               // relocations: base segment; imports: last entry of the list
+  u8 applied;
+  u8 unk7;
+  u32 addend;
+};
