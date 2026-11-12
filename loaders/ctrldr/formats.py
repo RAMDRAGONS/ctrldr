@@ -227,6 +227,12 @@ def describe_import_target(module, module_name, segment_offset):
     return f"{where} ({name})" if name else where
 
 
+# Largest addend an extern item is widened for. Real modules use offsets into
+# objects (vtable + 8, an array element); a bogus file must not make an item
+# gigabytes long.
+MAX_EXTERN_REACH = 0x100000
+
+
 def load_cro(src, path, base=0):
     """
     A CRO module mapped at base with the file laid out as is, so that
@@ -310,8 +316,12 @@ def load_cro(src, path, base=0):
         largest addend and those words still point inside it.
         """
         if key not in slots:
-            reach = max((p.addend for p in mod.import_patches(patch_off)), default=0)
-            size = align_up(max(reach, 0) + 4, 4)
+            addends = [p.addend - (1 << 32) if p.addend & 0x80000000 else p.addend
+                       for p in mod.import_patches(patch_off)]
+            reach = min(max(addends + [0]), MAX_EXTERN_REACH)
+            size = align_up(reach + 4, 4)
+            if cursor[0] + size > 0xFFFFFFFF:
+                raise LoaderError("CRO imports do not fit below 4 GiB")
             slots[key] = cursor[0]
             img.externs.append(cro.Extern(name, comment, cursor[0], size))
             cursor[0] += size
