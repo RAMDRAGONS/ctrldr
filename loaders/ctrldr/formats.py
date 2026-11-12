@@ -505,29 +505,32 @@ def load_3dsx(src):
 
 
 def load_3gx(src):
-    """Luma3DS game plugin: a flat image loaded at 0x07000000."""
-    base = 0x07000000
+    """
+    Luma3DS game plugin. The loader writes its PluginHeader at 0x07000000
+    and the executable right after it, .text, .rodata and .data back to back
+    then .bss; the 3GX header, strings and the checksum routines stay in the
+    file.
+    """
+    header_va = 0x07000000
+    base = header_va + 0x100
     exe = src.read(0x8 + 0x4 + 0x4 + 0x48, 0x28)
-    text_off, ro_off, data_off, text_size, ro_size, data_size, bss_size, \
-        load_fn, save_fn, swap_load_fn = struct.unpack_from("<10I", exe, 0)
-    blob = src.read(0, data_off + data_size)
-    secs = [Section(".header", base, text_off, 0, 4, "CONST"),
-            Section(".text", base + text_off, text_size, text_off, 5, "CODE")]
+    text_off, ro_off, data_off, text_size, ro_size, data_size, bss_size = \
+        struct.unpack_from("<7I", exe, 0)
+    blob = src.read(text_off, text_size) + src.read(ro_off, ro_size) + src.read(data_off, data_size)
+    secs = [Section(".plghdr", header_va, 0x100, -1, 6, "DATA"),
+            Section(".text", base, text_size, 0, 5, "CODE")]
     if ro_size:
-        secs.append(Section(".rodata", base + ro_off, ro_size, ro_off, 4, "CONST"))
+        secs.append(Section(".rodata", base + text_size, ro_size, text_size, 4, "CONST"))
     if data_size:
-        secs.append(Section(".data", base + data_off, data_size, data_off, 6, "DATA"))
+        secs.append(Section(".data", base + text_size + ro_size, data_size, text_size + ro_size, 6, "DATA"))
     if bss_size:
-        secs.append(Section(".bss", base + data_off + data_size, bss_size, -1, 6, "BSS"))
-    img = Image(kind="3GX", data=blob, sections=secs, entry=base + text_off,
-                layout_source="3GX header")
+        secs.append(Section(".bss", base + len(blob), bss_size, -1, 6, "BSS"))
+    img = Image(kind="3GX", data=blob, sections=secs, entry=base, layout_source="3GX header")
     img.symbols[img.entry] = "_start"
     img.functions.add(img.entry)
-    for addr, name in ((load_fn, "loadExeFunc"), (save_fn, "swapSaveFunc"),
-                       (swap_load_fn, "swapLoadFunc")):
-        if addr:
-            img.symbols[base + addr] = name
-            img.functions.add(base + addr)
+    img.symbols[header_va] = "g_PluginHeader"
+    img.data_symbols.add(header_va)
+    img.types.append((header_va, "PluginHeader", 1))
     return img
 
 

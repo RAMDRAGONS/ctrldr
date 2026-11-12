@@ -438,3 +438,21 @@ struct CroPatch
   u8 unk7;
   u32 addend;
 };
+
+// Written by the Luma3DS plugin loader at 0x07000000, in front of a 3GX
+// plugin's code.
+struct PluginHeader
+{
+  u32 magic;                      // "3GX$"
+  u32 version;
+  u32 heapVA;
+  u32 heapSize;
+  u32 exeSize;                    // header + .text + .rodata + .data + .bss, page aligned
+  u32 isDefaultPlugin;
+  s32 *plgldrEvent;
+  s32 *plgldrReply;
+  u8 notifyHomeEvent;
+  u8 padding[3];
+  u32 reserved[23];
+  u32 config[32];
+};

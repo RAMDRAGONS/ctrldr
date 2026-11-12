@@ -333,7 +333,7 @@ def populate(img):
             log("no ctr_*.sig under sig/arm; tools/build_ctr_sigs.py builds them from the SDK")
 
     write_metadata(img)
-    text = img.sections[0]
+    text = next((s for s in img.sections if s.name == ".text"), img.sections[0])
     hook = PostAnalysis(text.start, text.start + text.size, middleware)
     hook.hook()
     ctrldr._post_hook = hook
