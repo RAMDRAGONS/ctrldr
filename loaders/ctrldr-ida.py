@@ -340,17 +340,17 @@ def populate(img):
 
 
 def add_externs(img):
-    """Imported symbols of a CRO: one named dword per import, which the patched words point at."""
+    """Imported symbols of a CRO: one named item per import, which the patched words point at."""
     if not img.externs:
         return
-    start = img.extern_base
-    add_segment(start, start + 4 * len(img.externs), "extern", "XTRN", 4,
+    last = img.externs[-1]
+    add_segment(img.extern_base, last.address + last.size, "extern", "XTRN", 4,
                 sparse=True, seg_type=ida_segment.SEG_XTRN)
-    for i, ext in enumerate(img.externs):
-        ea = start + 4 * i
-        ida_bytes.create_dword(ea, 4)
-        set_name(ea, ext.name)
-        ida_bytes.set_cmt(ea, ext.comment, True)
+    for ext in img.externs:
+        # One item over the whole slot, so words carrying an addend show as name+N.
+        ida_bytes.create_data(ext.address, ida_bytes.FF_DWORD, ext.size, ida_idaapi.BADADDR)
+        set_name(ext.address, ext.name)
+        ida_bytes.set_cmt(ext.address, ext.comment, True)
 
 
 def ida_fixup_data(target):

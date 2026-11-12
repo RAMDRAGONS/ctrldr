@@ -286,6 +286,8 @@ def apply_patch(image, base, loc, kind, value_target):
 class Extern:
     name: str
     comment: str
+    address: int
+    size: int
 
 
 class CroLayout:

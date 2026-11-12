@@ -301,11 +301,20 @@ def load_cro(src, path, base=0):
 
     img.extern_base = align_up(lay.end, PAGE)
     slots = {}
+    cursor = [img.extern_base]
 
-    def slot(key, name, comment):
+    def slot(key, name, comment, patch_off):
+        """
+        The extern item of an import. Patches add their addend to it (a
+        typeinfo's vtable pointer is the vtable + 8), so the item spans the
+        largest addend and those words still point inside it.
+        """
         if key not in slots:
-            slots[key] = img.extern_base + 4 * len(img.externs)
-            img.externs.append(cro.Extern(name, comment))
+            reach = max((p.addend for p in mod.import_patches(patch_off)), default=0)
+            size = align_up(max(reach, 0) + 4, 4)
+            slots[key] = cursor[0]
+            img.externs.append(cro.Extern(name, comment, cursor[0], size))
+            cursor[0] += size
         return slots[key]
 
     def patch_list(patch_off, target):
@@ -340,7 +349,7 @@ def load_cro(src, path, base=0):
                 name = export or (f"{imod.name}_{off:X}" if off is not None else
                                   f"{imod.name}_seg{so & 0xF}_{so >> 4:X}")
                 comment = where
-            patch_list(patch_off, slot((imod.name, so), name, comment))
+            patch_list(patch_off, slot((imod.name, so), name, comment, patch_off))
         for index, patch_off in imod.indexed:
             target_so = None
             if other is not None and index < len(other.indexed_exports()):
@@ -349,11 +358,11 @@ def load_cro(src, path, base=0):
                 or f"{imod.name}_export_{index}"
             comment = describe_import_target(other, imod.name, target_so) if target_so is not None \
                 else f"{imod.name} indexed export {index}"
-            patch_list(patch_off, slot((imod.name, "index", index), name, comment))
+            patch_list(patch_off, slot((imod.name, "index", index), name, comment, patch_off))
     for name, patch_off in mod.named_imports():
         ea = static_exports.get(name)
         comment = f"code.bin 0x{ea:08X}" if ea is not None else "resolved by name at load"
-        patch_list(patch_off, slot(("name", name), name, comment))
+        patch_list(patch_off, slot(("name", name), name, comment, patch_off))
 
     # Exports and the entry points in the header
     for name, so in mod.named_exports():

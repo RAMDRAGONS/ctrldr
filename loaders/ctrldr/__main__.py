@@ -31,8 +31,8 @@ def main(argv=None):
           f"{len(img.comments)} comments")
     if img.externs:
         print(f"  extern segment at 0x{img.extern_base:08X}: {len(img.externs)} imports")
-        for i, e in enumerate(img.externs):
-            print(f"    0x{img.extern_base + 4 * i:08X} {e.name}  ; {e.comment}")
+        for e in img.externs:
+            print(f"    0x{e.address:08X} {e.name}  ; {e.comment}")
     for line in img.info:
         print("  " + line)
     for n in img.notes:
